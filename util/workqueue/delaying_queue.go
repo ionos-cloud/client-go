@@ -18,7 +18,11 @@ package workqueue
 
 import (
 	"container/heap"
+	"fmt"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/clock"
@@ -31,6 +35,8 @@ type DelayingInterface interface {
 	Interface
 	// AddAfter adds an item to the workqueue after the indicated duration has passed
 	AddAfter(item interface{}, duration time.Duration)
+	// Dump returns a string describing the workqueue's inner state.
+	Dump() string
 }
 
 // NewDelayingQueue constructs a new workqueue with delayed queuing ability
@@ -58,20 +64,34 @@ func NewDelayingQueueWithCustomClock(clock clock.Clock, name string) DelayingInt
 func newDelayingQueue(clock clock.Clock, q Interface, name string) *delayingType {
 	ret := &delayingType{
 		Interface:       q,
+		name:            name,
 		clock:           clock,
 		heartbeat:       clock.NewTicker(maxWait),
 		stopCh:          make(chan struct{}),
 		waitingForAddCh: make(chan *waitFor, 1000),
 		metrics:         newRetryMetrics(name),
+		waitingForQueue: &waitForPriorityQueue{},
 	}
 
 	go ret.waitingLoop()
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGUSR1)
+	go func() {
+		for {
+			<-ch
+			fmt.Println(ret.Dump())
+		}
+	}()
+
 	return ret
 }
 
 // delayingType wraps an Interface and provides delayed re-enquing
 type delayingType struct {
 	Interface
+
+	name string
 
 	// clock tracks time for delayed firing
 	clock clock.Clock
@@ -83,6 +103,8 @@ type delayingType struct {
 
 	// heartbeat ensures we wait no more than maxWait before firing
 	heartbeat clock.Ticker
+
+	waitingForQueue *waitForPriorityQueue
 
 	// waitingForAddCh is a buffered channel that feeds waitingForAdd
 	waitingForAddCh chan *waitFor
@@ -146,6 +168,47 @@ func (pq waitForPriorityQueue) Peek() interface{} {
 	return pq[0]
 }
 
+// Dump returns a string describing the workqueue's inner state.
+func (q *delayingType) Dump() string {
+	qTyped, ok := q.Interface.(*Type)
+	if !ok {
+		return fmt.Sprintf("underlying %s workqueue has an unexpected type: %T", q.name, q.Interface)
+	}
+	qTyped.cond.L.Lock()
+	defer qTyped.cond.L.Unlock()
+
+	dump := fmt.Sprintf("%s items currently being processed: %d\n", q.name, len(qTyped.processing))
+	for item := range qTyped.processing {
+		dump += fmt.Sprintf("  - %s\n", item)
+	}
+
+	dump += fmt.Sprintf("%s items waiting in the queue: %d\n", q.name, len(qTyped.queue))
+	for _, item := range qTyped.queue {
+		dump += fmt.Sprintf("  - %s\n", item)
+	}
+
+	dump += fmt.Sprintf("%s items waiting to be processed (i.e. dirty ones): %d\n", q.name, len(qTyped.dirty))
+	for item := range qTyped.dirty {
+		dump += fmt.Sprintf("  - %s\n", item)
+	}
+
+	priorityQueueCopy := make(waitForPriorityQueue, 0, len(*q.waitingForQueue))
+	for _, item := range *q.waitingForQueue {
+		itemCopy := *item
+		priorityQueueCopy = append(priorityQueueCopy, &itemCopy)
+	}
+	heap.Init(&priorityQueueCopy)
+	now := q.clock.Now()
+
+	dump += fmt.Sprintf("%s items delayed: %d\n", q.name, priorityQueueCopy.Len())
+	for priorityQueueCopy.Len() > 0 {
+		item := heap.Pop(&priorityQueueCopy).(*waitFor)
+		dump += fmt.Sprintf("  - %s (adding to queue in %s)\n", item.data, item.readyAt.Sub(now).Round(time.Second))
+	}
+
+	return dump
+}
+
 // ShutDown stops the queue. After the queue drains, the returned shutdown bool
 // on Get() will be true. This method may be invoked more than once.
 func (q *delayingType) ShutDown() {
@@ -193,8 +256,7 @@ func (q *delayingType) waitingLoop() {
 	// Make a timer that expires when the item at the head of the waiting queue is ready
 	var nextReadyAtTimer clock.Timer
 
-	waitingForQueue := &waitForPriorityQueue{}
-	heap.Init(waitingForQueue)
+	heap.Init(q.waitingForQueue)
 
 	waitingEntryByData := map[t]*waitFor{}
 
@@ -206,24 +268,24 @@ func (q *delayingType) waitingLoop() {
 		now := q.clock.Now()
 
 		// Add ready entries
-		for waitingForQueue.Len() > 0 {
-			entry := waitingForQueue.Peek().(*waitFor)
+		for q.waitingForQueue.Len() > 0 {
+			entry := q.waitingForQueue.Peek().(*waitFor)
 			if entry.readyAt.After(now) {
 				break
 			}
 
-			entry = heap.Pop(waitingForQueue).(*waitFor)
+			entry = heap.Pop(q.waitingForQueue).(*waitFor)
 			q.Add(entry.data)
 			delete(waitingEntryByData, entry.data)
 		}
 
 		// Set up a wait for the first item's readyAt (if one exists)
 		nextReadyAt := never
-		if waitingForQueue.Len() > 0 {
+		if q.waitingForQueue.Len() > 0 {
 			if nextReadyAtTimer != nil {
 				nextReadyAtTimer.Stop()
 			}
-			entry := waitingForQueue.Peek().(*waitFor)
+			entry := q.waitingForQueue.Peek().(*waitFor)
 			nextReadyAtTimer = q.clock.NewTimer(entry.readyAt.Sub(now))
 			nextReadyAt = nextReadyAtTimer.C()
 		}
@@ -240,7 +302,7 @@ func (q *delayingType) waitingLoop() {
 
 		case waitEntry := <-q.waitingForAddCh:
 			if waitEntry.readyAt.After(q.clock.Now()) {
-				insert(waitingForQueue, waitingEntryByData, waitEntry)
+				insert(q.waitingForQueue, waitingEntryByData, waitEntry)
 			} else {
 				q.Add(waitEntry.data)
 			}
@@ -250,7 +312,7 @@ func (q *delayingType) waitingLoop() {
 				select {
 				case waitEntry := <-q.waitingForAddCh:
 					if waitEntry.readyAt.After(q.clock.Now()) {
-						insert(waitingForQueue, waitingEntryByData, waitEntry)
+						insert(q.waitingForQueue, waitingEntryByData, waitEntry)
 					} else {
 						q.Add(waitEntry.data)
 					}
